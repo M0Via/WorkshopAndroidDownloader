@@ -692,17 +692,25 @@ class OkHttpSteamCmSession(
         fun accepts(emsg: Int): Boolean = emsg == expectedEmsg
 
         fun complete(packet: SteamPacket) {
-            if (packet.header.hasEresult() && packet.header.eresult != 1) {
+            val resultCode = if (packet.header.hasEresult()) packet.header.eresult else 1
+            // 【扫码登录】PollAuthSessionStatus 在"手机尚未确认"期间，Steam 会以 header EResult=Busy(9)
+            // 返回，同时 body 可能携带 new_challenge_url（二维码轮换帧）。这是正常的 pending 状态，
+            // 不能当成致命错误——否则用户还没点确认登录就中止，且会丢失二维码刷新帧。
+            // 这里仅对该方法 + 该错误码放行，让 body 正常解析；上层 pollStatus() 看到 refresh_token
+            // 为空会返回 null 并继续轮询。其余方法/错误码行为保持不变。
+            val pendingPollBusy = methodName == POLL_AUTH_SESSION_METHOD && resultCode == ERESULT_BUSY
+            if (resultCode != 1 && !pendingPollBusy) {
                 deferred.completeExceptionallyIfNeeded(
                     SteamServiceMethodException(
                         methodName = methodName,
-                        resultCode = packet.header.eresult,
+                        resultCode = resultCode,
                         steamMessage = if (packet.header.hasErrorMessage()) packet.header.errorMessage else null,
                     ),
                 )
                 return
             }
             if (!deferred.isCompleted) {
+                // Busy 时 body 可能为空串；protobuf 对空字节 parseFrom 返回 default instance，属合法解析。
                 deferred.complete(parser.parseFrom(packet.body))
             }
         }
@@ -727,6 +735,10 @@ class OkHttpSteamCmSession(
         private const val REQUEST_TIMEOUT_MS = DEFAULT_HTTP_TIMEOUT_SECONDS * 1_000L
         private const val MAX_CONNECTION_CANDIDATES = 12
         private const val MAX_LOGON_ATTEMPTS = 2
+
+        // EResult.k_EResultBusy：认证会话仍在进行中（等待用户在手机确认），是 pending 而非失败。
+        private const val ERESULT_BUSY = 9
+        private const val POLL_AUTH_SESSION_METHOD = "Authentication.PollAuthSessionStatus#1"
     }
 }
 

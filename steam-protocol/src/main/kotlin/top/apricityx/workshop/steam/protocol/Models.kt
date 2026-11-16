@@ -85,6 +85,19 @@ data class SteamAuthSessionDetails(
     val clientOsType: Int = DEFAULT_CLIENT_OS_TYPE,
 )
 
+// 【扫码登录】发起二维码认证会话所需参数。相比密码登录，不需要账号、密码、guardData。
+data class SteamQrAuthSessionDetails(
+    val isPersistentSession: Boolean = true,
+    val deviceFriendlyName: String = DEFAULT_MACHINE_NAME,
+    val clientOsType: Int = DEFAULT_CLIENT_OS_TYPE,
+)
+
+// 【扫码登录】统一认证会话契约：密码登录与扫码登录都实现它，
+// 使 app 层的 finalizePendingAuth 可以用同一套逻辑 awaitResult + close + persistAccount。
+interface SteamAuthSession : Closeable {
+    suspend fun awaitResult(): SteamAuthPollResult
+}
+
 data class SteamGuardChallenge(
     val type: SteamGuardChallengeType,
     val message: String? = null,

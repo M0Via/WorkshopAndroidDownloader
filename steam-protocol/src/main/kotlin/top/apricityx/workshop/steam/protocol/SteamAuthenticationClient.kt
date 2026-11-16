@@ -5,6 +5,8 @@ import top.apricityx.workshop.steam.proto.CAuthentication_AccessToken_GenerateFo
 import top.apricityx.workshop.steam.proto.CAuthentication_AllowedConfirmation
 import top.apricityx.workshop.steam.proto.CAuthentication_BeginAuthSessionViaCredentials_Request
 import top.apricityx.workshop.steam.proto.CAuthentication_BeginAuthSessionViaCredentials_Response
+import top.apricityx.workshop.steam.proto.CAuthentication_BeginAuthSessionViaQR_Request
+import top.apricityx.workshop.steam.proto.CAuthentication_BeginAuthSessionViaQR_Response
 import top.apricityx.workshop.steam.proto.CAuthentication_DeviceDetails
 import top.apricityx.workshop.steam.proto.CAuthentication_GetPasswordRSAPublicKey_Request
 import top.apricityx.workshop.steam.proto.CAuthentication_GetPasswordRSAPublicKey_Response
@@ -18,6 +20,7 @@ import top.apricityx.workshop.steam.proto.EAuthSessionGuardType
 import top.apricityx.workshop.steam.proto.EAuthTokenPlatformType
 import top.apricityx.workshop.steam.proto.ESessionPersistence
 import top.apricityx.workshop.steam.proto.ETokenRenewalType
+import com.google.protobuf.ByteString
 import kotlinx.coroutines.delay
 import java.io.Closeable
 import java.math.BigInteger
@@ -87,6 +90,58 @@ class SteamAuthenticationClient(
             debugLogger.log("Protocol: credential auth failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
             session.close()
             throw error.asAuthenticationException("Steam 登录失败")
+        }
+    }
+
+    // 【扫码登录】发起二维码认证会话，服务端返回 challenge_url，手机 Steam App 扫码后在手机上确认即可。
+    // 拿到的 clientId/requestId 与密码登录同构，后续统一走 PollAuthSessionStatus 轮询。
+    suspend fun beginQrAuthSession(
+        details: SteamQrAuthSessionDetails,
+        debugLogger: ((String) -> Unit)? = null,
+    ): SteamQrAuthSession {
+        val cmServers = directoryClient.loadServers()
+        val session = sessionFactory()
+        try {
+            debugLogger.log("Protocol: loaded ${cmServers.size} CM server candidate(s) for QR auth.")
+            session.connect(cmServers)
+            debugLogger.log("Protocol: connected to Steam CM for QR auth.")
+            debugLogger.log(
+                "Protocol: beginning QR auth session deviceName=${details.deviceFriendlyName} osType=${details.clientOsType}.",
+            )
+            val response = session.callServiceMethod(
+                methodName = "Authentication.BeginAuthSessionViaQR#1",
+                request = CAuthentication_BeginAuthSessionViaQR_Request.newBuilder()
+                    .setDeviceFriendlyName(details.deviceFriendlyName)
+                    .setPlatformType(EAuthTokenPlatformType.k_EAuthTokenPlatformType_SteamClient)
+                    .setDeviceDetails(
+                        CAuthentication_DeviceDetails.newBuilder()
+                            .setDeviceFriendlyName(details.deviceFriendlyName)
+                            .setPlatformType(EAuthTokenPlatformType.k_EAuthTokenPlatformType_SteamClient)
+                            .setOsType(details.clientOsType)
+                            .build(),
+                    )
+                    .build(),
+                parser = CAuthentication_BeginAuthSessionViaQR_Response.parser(),
+            )
+            val challengeUrl = response.challengeUrl
+            require(challengeUrl.isNotBlank()) { "Steam 未返回二维码地址" }
+            debugLogger.log(
+                "Protocol: QR auth session started clientId=${response.clientId} intervalSeconds=${response.interval} " +
+                    "version=${response.version} requestIdBytes=${response.requestId.size()} " +
+                    "challengeUrlLength=${challengeUrl.length} challengeUrlPrefix=${challengeUrl.take(24)}.",
+            )
+            return SteamQrAuthSession(
+                session = session,
+                clientId = response.clientId,
+                requestId = response.requestId.toByteArray(),
+                initialChallengeUrl = challengeUrl,
+                pollingIntervalMillis = (response.interval * 1_000f).toLong().coerceAtLeast(1_000L),
+                debugLogger = debugLogger,
+            )
+        } catch (error: Throwable) {
+            debugLogger.log("Protocol: QR auth failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+            session.close()
+            throw error.asAuthenticationException("Steam 扫码登录失败")
         }
     }
 
@@ -170,7 +225,7 @@ class SteamCredentialAuthSession internal constructor(
     val pollingIntervalMillis: Long,
     val challenges: List<SteamGuardChallenge>,
     private val debugLogger: ((String) -> Unit)? = null,
-) : Closeable {
+) : SteamAuthSession {
     suspend fun submitGuardCode(
         type: SteamGuardChallengeType,
         code: String,
@@ -225,7 +280,7 @@ class SteamCredentialAuthSession internal constructor(
         }
     }
 
-    suspend fun awaitResult(): SteamAuthPollResult {
+    override suspend fun awaitResult(): SteamAuthPollResult {
         debugLogger.log("Protocol: waiting for auth result pollIntervalMs=$pollingIntervalMillis.")
         var attempts = 0
         while (true) {
@@ -241,6 +296,97 @@ class SteamCredentialAuthSession internal constructor(
 
     override fun close() {
         session.close()
+    }
+}
+
+// 【扫码登录】二维码认证会话。与密码会话同构，差异点：
+// 1) 持有 challengeUrl（二维码内容），Steam 会周期性刷新（new_challenge_url），通过 onChallengeUrlChanged 回调 UI 更新图片；
+// 2) 轮询复用 PollAuthSessionStatus，拿到 refreshToken 后组装成统一的 SteamAuthPollResult。
+class SteamQrAuthSession internal constructor(
+    private val session: SteamCmSession,
+    private val clientId: Long,
+    private val requestId: ByteArray,
+    initialChallengeUrl: String,
+    val pollingIntervalMillis: Long,
+    private val debugLogger: ((String) -> Unit)? = null,
+) : SteamAuthSession {
+    // 当前二维码 URL；Steam 刷新时原地更新，UI 每次读取最新值即可。
+    @Volatile
+    var challengeUrl: String = initialChallengeUrl
+        private set
+
+    // URL 刷新回调（可选）：UI 注册后可在新帧到达时重绘二维码 / 刷新"一键分享"的图片。
+    @Volatile
+    var onChallengeUrlChanged: ((String) -> Unit)? = null
+
+    suspend fun pollStatus(): SteamAuthPollResult? {
+        try {
+            debugLogger.log("Protocol: polling QR auth session status clientId=$clientId.")
+            val response = session.callServiceMethod(
+                methodName = "Authentication.PollAuthSessionStatus#1",
+                request = CAuthentication_PollAuthSessionStatus_Request.newBuilder()
+                    .setClientId(clientId)
+                    .setRequestId(ByteString.copyFrom(requestId))
+                    .build(),
+                parser = CAuthentication_PollAuthSessionStatus_Response.parser(),
+            )
+            // Steam 可能下发新的二维码 URL，代表旧帧已失效——立即更新并通知 UI。
+            val refreshedUrl = response.newChallengeUrl
+            if (refreshedUrl.isNotBlank() && refreshedUrl != challengeUrl) {
+                debugLogger.log("Protocol: QR challenge URL refreshed newLength=${refreshedUrl.length}.")
+                challengeUrl = refreshedUrl
+                onChallengeUrlChanged?.invoke(refreshedUrl)
+            }
+            if (response.refreshToken.isBlank()) {
+                debugLogger.log("Protocol: QR auth session still pending (waiting for phone confirmation).")
+                return null
+            }
+            debugLogger.log(
+                "Protocol: QR auth session completed account=${response.accountName.maskForLog()} refreshLength=${response.refreshToken.length} accessLength=${response.accessToken.length}.",
+            )
+            // steamId 以 refreshToken(JWT) 的 sub 字段为准，与 app 层 parseSteamJwtInfo 保持一致。
+            val steamId = extractSteamIdFromJwt(response.refreshToken)
+                ?: extractSteamIdFromJwt(response.accessToken)
+                ?: 0L
+            return SteamAuthPollResult(
+                steamId = steamId,
+                accountName = response.accountName,
+                refreshToken = response.refreshToken,
+                accessToken = response.accessToken,
+                newGuardData = response.newGuardData.takeIf(String::isNotBlank),
+            )
+        } catch (error: Throwable) {
+            debugLogger.log("Protocol: QR PollAuthSessionStatus failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+            throw error.asAuthenticationException("轮询扫码登录状态失败")
+        }
+    }
+
+    override suspend fun awaitResult(): SteamAuthPollResult {
+        debugLogger.log("Protocol: waiting for QR auth result pollIntervalMs=$pollingIntervalMillis.")
+        var attempts = 0
+        while (true) {
+            attempts += 1
+            pollStatus()?.let { return it }
+            delay(pollingIntervalMillis)
+        }
+    }
+
+    override fun close() {
+        session.close()
+    }
+
+    // 与 app 层 SteamTokenProjection.parseSteamJwtInfo 相同的解析口径：steamId 在 JWT 的 sub 字段。
+    private fun extractSteamIdFromJwt(jwt: String): Long? {
+        val parts = jwt.split('.')
+        if (parts.size < 2) return null
+        return runCatching {
+            val normalized = parts[1]
+                .replace('-', '+')
+                .replace('_', '/')
+                .padEnd((parts[1].length + 3) / 4 * 4, '=')
+            val json = java.util.Base64.getDecoder().decode(normalized).toString(Charsets.UTF_8)
+            Regex("\"sub\"\\s*:\\s*\"?(\\d{10,})\"?").find(json)?.groupValues?.get(1)?.toLong()
+        }.getOrNull()
     }
 }
 
