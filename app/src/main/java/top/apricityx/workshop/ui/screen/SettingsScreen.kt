@@ -5,12 +5,14 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -35,6 +37,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
@@ -80,6 +83,7 @@ fun SettingsScreen(
     onUpdateSteamGuardCode: (String) -> Unit,
     onSwitchSteamLoginInputMode: (SteamLoginInputMode) -> Unit,
     onSubmitSteamLogin: () -> Unit,
+    onStartQrLogin: () -> Unit,
     onOpenRuntimeLog: () -> Unit,
     onShareRuntimeLogBundle: () -> Unit,
     onExportRuntimeLogBundle: () -> Unit,
@@ -586,6 +590,7 @@ fun SettingsScreen(
             onGuardCodeChange = onUpdateSteamGuardCode,
             onSwitchInputMode = onSwitchSteamLoginInputMode,
             onSubmit = onSubmitSteamLogin,
+            onStartQrLogin = onStartQrLogin,
         )
     }
 }
@@ -839,8 +844,11 @@ private fun SteamLoginDialog(
     onGuardCodeChange: (String) -> Unit,
     onSwitchInputMode: (SteamLoginInputMode) -> Unit,
     onSubmit: () -> Unit,
+    onStartQrLogin: () -> Unit,
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val isTokenMode = state.inputMode == SteamLoginInputMode.RefreshToken
+    val isQrMode = state.inputMode == SteamLoginInputMode.QrCode
     val isConfirmationChallenge = state.challengeType.isSteamConfirmationChallenge()
 
     WorkshopTransparentGlassDialog(
@@ -860,7 +868,7 @@ private fun SteamLoginDialog(
                 Text("关闭")
             }
             WorkshopButton(
-                onClick = onSubmit,
+                onClick = if (isQrMode) onStartQrLogin else onSubmit,
                 enabled = !state.isSubmitting && !state.isPollingConfirmation,
             ) {
                 if (state.isSubmitting) {
@@ -871,6 +879,8 @@ private fun SteamLoginDialog(
                 }
                 Text(
                     when {
+                        isQrMode -> if (state.qrChallengeUrl == null) "生成登录二维码" else "刷新二维码"
+
                         isTokenMode -> if (state.mode == SteamLoginDialogMode.Reauthenticate) {
                             "导入令牌"
                         } else {
@@ -894,6 +904,75 @@ private fun SteamLoginDialog(
         },
     ) {
         when {
+            isQrMode -> {
+                Text(
+                    "用手机 Steam App 扫描下方二维码，在手机上确认授权即可登录。授权范围与时效由 Steam 在手机上决定，你可选择仅授权一次。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                val challengeUrl = state.qrChallengeUrl
+                if (challengeUrl.isNullOrBlank()) {
+                    Text(
+                        "点击下方\"生成登录二维码\"开始。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    val qrBitmap = remember(challengeUrl) {
+                        top.apricityx.workshop.QrLoginShareManager.generateQrBitmap(challengeUrl)
+                    }
+                    if (qrBitmap != null) {
+                        Image(
+                            bitmap = qrBitmap.asImageBitmap(),
+                            contentDescription = "Steam 登录二维码（第 ${state.qrFrameSeq} 帧）",
+                            modifier = Modifier
+                                .size(220.dp)
+                                .align(Alignment.CenterHorizontally),
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        WorkshopOutlinedButton(
+                            onClick = {
+                                val uri = state.qrShareUri
+                                if (uri != null) {
+                                    val shareIntent = top.apricityx.workshop.QrLoginShareManager
+                                        .createShareQrIntent(context, uri)
+                                    if (shareIntent != null) {
+                                        runCatching { context.startActivity(shareIntent) }
+                                    }
+                                }
+                            },
+                            enabled = state.qrShareUri != null,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("一键分享二维码给朋友扫码")
+                        }
+                    } else {
+                        Text(
+                            "二维码生成失败，请点\"刷新二维码\"重试。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    if (state.isPollingConfirmation) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Text(
+                                "等待扫码确认…（二维码会自动刷新，分享的图片始终是最新帧）",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+
             isTokenMode -> {
                 Text(
                     if (state.mode == SteamLoginDialogMode.Reauthenticate) {
@@ -992,24 +1071,19 @@ private fun SteamLoginDialog(
         if (state.canSwitchSteamLoginInputMode()) {
             WorkshopTextButton(
                 onClick = {
-                    onSwitchInputMode(
-                        if (isTokenMode) {
-                            SteamLoginInputMode.Credentials
-                        } else {
-                            SteamLoginInputMode.RefreshToken
-                        },
-                    )
+                    val next = when (state.inputMode) {
+                        SteamLoginInputMode.Credentials -> SteamLoginInputMode.QrCode
+                        SteamLoginInputMode.QrCode -> SteamLoginInputMode.RefreshToken
+                        SteamLoginInputMode.RefreshToken -> SteamLoginInputMode.Credentials
+                    }
+                    onSwitchInputMode(next)
                 },
             ) {
                 Text(
-                    if (isTokenMode) {
-                        if (state.mode == SteamLoginDialogMode.Reauthenticate) {
-                            "改用密码重新认证"
-                        } else {
-                            "改用账号密码登录"
-                        }
-                    } else {
-                        "改为输入令牌登录"
+                    when (state.inputMode) {
+                        SteamLoginInputMode.Credentials -> "改用扫码登录"
+                        SteamLoginInputMode.QrCode -> "改为输入令牌登录"
+                        SteamLoginInputMode.RefreshToken -> "改用账号密码登录"
                     },
                 )
             }
