@@ -920,6 +920,9 @@ class WorkshopViewModel(
                             isPollingConfirmation = false,
                             isSubmitting = false,
                             errorMessage = null,
+                            qrChallengeUrl = null,
+                            qrShareUri = null,
+                            qrFrameSeq = 0,
                         ),
                     ),
                     message = null,
@@ -990,6 +993,79 @@ class WorkshopViewModel(
                     appendSteamLoginFailure("UI: Steam login step failed.", error)
                     setSteamLoginSubmitting(false, error.message ?: "Steam 登录失败。")
                 }
+        }
+    }
+
+    // 【扫码登录】发起二维码会话：更新 UI 的 challengeUrl，生成可分享的二维码图片，并启动后台轮询等待手机确认。
+    fun startQrLogin() {
+        val dialog = _uiState.value.settingsState.steamAuthState.loginDialogState ?: return
+        ensureSteamLoginAttempt(dialog)
+        appendSteamLoginDebugLine("UI: starting QR-code login.")
+        setSteamLoginSubmitting(true)
+        // 二维码刷新回调：URL 变化时更新 state 并重新生成分享图片（seq 递增驱动 UI 重绘）。
+        val onUrlChanged: (String) -> Unit = { newUrl ->
+            appendSteamLoginDebugLine("UI: QR challenge URL refreshed newLength=${newUrl.length}.")
+            refreshQrShareArtifacts(newUrl)
+        }
+        viewModelScope.launch {
+            val result = runCatching {
+                steamAuthRepository.beginQrSignIn(
+                    replaceAccountId = dialog.targetAccountId,
+                    onChallengeUrlChanged = onUrlChanged,
+                    debugLogger = ::appendSteamLoginDebugLine,
+                )
+            }
+            result.onSuccess { step ->
+                when (step) {
+                    is SteamSignInStep.QrCodeReady -> {
+                        appendSteamLoginDebugLine("UI: QR ready, generating share image and waiting for phone confirmation.")
+                        refreshQrShareArtifacts(step.challengeUrl)
+                        setSteamLoginSubmitting(false)
+                        startSteamConfirmationWait(
+                            waitAction = { logger ->
+                                steamAuthRepository.waitForQrConfirmation(debugLogger = logger)
+                            },
+                        )
+                    }
+                    else -> {
+                        appendSteamLoginFailure(
+                            "UI: unexpected QR login step=${step::class.simpleName}.",
+                            IllegalStateException("Unexpected QR login step: ${step::class.simpleName}"),
+                        )
+                        setSteamLoginSubmitting(false, "扫码登录状态异常。")
+                    }
+                }
+            }.onFailure { error ->
+                appendSteamLoginFailure("UI: QR login start failed.", error)
+                setSteamLoginSubmitting(false, error.message ?: "发起扫码登录失败。")
+            }
+        }
+    }
+
+    // 由 challengeUrl 生成二维码 PNG 并写入 exports/，把 contentUri 存进 state 供"一键分享"和 UI 显示。
+    private fun refreshQrShareArtifacts(challengeUrl: String) {
+        val context = getApplication<Application>()
+        val bitmap = QrLoginShareManager.generateQrBitmap(challengeUrl)
+        val shareUri = bitmap?.let { QrLoginShareManager.saveQrToShareUri(context, it) }
+        _uiState.update { state ->
+            val dialog = state.settingsState.steamAuthState.loginDialogState ?: return@update state
+            state.copy(
+                settingsState = state.settingsState.copy(
+                    steamAuthState = state.settingsState.steamAuthState.copy(
+                        loginDialogState = dialog.copy(
+                            inputMode = SteamLoginInputMode.QrCode,
+                            qrChallengeUrl = challengeUrl,
+                            qrShareUri = shareUri,
+                            qrFrameSeq = dialog.qrFrameSeq + 1,
+                            isPollingConfirmation = true,
+                            errorMessage = null,
+                        ),
+                    ),
+                ),
+            )
+        }
+        if (shareUri == null) {
+            appendSteamLoginDebugLine("UI: QR share image generation failed.")
         }
     }
 
@@ -2917,6 +2993,12 @@ class WorkshopViewModel(
 
     private fun applySteamSignInStep(step: SteamSignInStep) {
         when (step) {
+            is SteamSignInStep.QrCodeReady -> {
+                // 通常由 startQrLogin 直接处理；这里作为兜底，保证二维码能显示出来。
+                appendSteamLoginDebugLine("UI: applySteamSignInStep received QrCodeReady.")
+                refreshQrShareArtifacts(step.challengeUrl)
+            }
+
             is SteamSignInStep.RequiresGuardCode -> {
                 cancelSteamConfirmationWaitJob()
                 appendSteamLoginDebugLine(
@@ -3260,14 +3342,20 @@ class WorkshopViewModel(
         return allTransfersSucceeded
     }
 
-    private fun startSteamConfirmationWait() {
+    private fun startSteamConfirmationWait(
+        waitAction: (suspend ((String) -> Unit) -> SteamSignInStep)? = null,
+    ) {
         cancelSteamConfirmationWaitJob()
         appendSteamLoginDebugLine("UI: starting background wait for Steam confirmation.")
         steamConfirmationWaitJob = viewModelScope.launch {
             runCatching {
-                steamAuthRepository.waitForPendingConfirmation(
-                    debugLogger = ::appendSteamLoginDebugLine,
-                )
+                if (waitAction != null) {
+                    waitAction(::appendSteamLoginDebugLine)
+                } else {
+                    steamAuthRepository.waitForPendingConfirmation(
+                        debugLogger = ::appendSteamLoginDebugLine,
+                    )
+                }
             }
                 .onSuccess(::applySteamSignInStep)
                 .onFailure { error ->
