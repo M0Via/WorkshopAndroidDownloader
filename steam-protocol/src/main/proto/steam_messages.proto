@@ -226,6 +226,31 @@ message CAuthentication_BeginAuthSessionViaCredentials_Response {
   optional string extended_error_message = 8;
 }
 
+// 【扫码登录】CAuthentication.BeginAuthSessionViaQR#1
+// 与 ViaCredentials 的差异：不带账号密码，改为服务端下发 challenge_url 供手机 Steam App 扫码。
+// 拿到 client_id/request_id 后，后续轮询与密码登录完全一致（复用 PollAuthSessionStatus#1）。
+// 字段号严格对齐 Steam 官方 steammessages_auth.steamclient.proto：
+// device_friendly_name=1, platform_type=2, device_details=3, website_id=4。
+// os_type 只属于 DeviceDetails，不是本消息的顶层字段。
+message CAuthentication_BeginAuthSessionViaQR_Request {
+  optional string device_friendly_name = 1;
+  optional EAuthTokenPlatformType platform_type = 2 [default = k_EAuthTokenPlatformType_SteamClient];
+  optional CAuthentication_DeviceDetails device_details = 3;
+  optional string website_id = 4 [default = "Unknown"];
+}
+
+// 官方定义：challenge_url=2, request_id=3, version=6。
+// 此前误把 request_id/challenge_url 写成 2/3 互换且缺 version，
+// 导致 challenge_url 被当作 bytes 解析成乱码 → 二维码无法被 Steam App 识别。
+message CAuthentication_BeginAuthSessionViaQR_Response {
+  optional uint64 client_id = 1;
+  optional string challenge_url = 2;
+  optional bytes request_id = 3;
+  optional float interval = 4;
+  repeated CAuthentication_AllowedConfirmation allowed_confirmations = 5;
+  optional int32 version = 6;
+}
+
 message CAuthentication_PollAuthSessionStatus_Request {
   optional uint64 client_id = 1;
   optional bytes request_id = 2;
